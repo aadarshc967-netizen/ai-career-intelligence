@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 
+const API_BASE_URL = "https://ai-career-intelligence-7x5r.onrender.com";
+
 export default function ResumeUpload() {
   const [file, setFile] = useState<File | null>(null);
   const [targetRole, setTargetRole] = useState("Python Backend Developer");
@@ -18,7 +20,7 @@ export default function ResumeUpload() {
 
   const fetchHistory = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/user-history/${userEmail}`);
+      const response = await fetch(`${API_BASE_URL}/user-history/${userEmail}`);
       if (response.ok) {
         const data = await response.json();
         setHistory(data);
@@ -51,7 +53,7 @@ export default function ResumeUpload() {
     setNotification(null);
 
     try {
-      const response = await fetch("http://localhost:8000/analyze-career", {
+      const response = await fetch(`${API_BASE_URL}/analyze-career`, {
         method: "POST",
         body: formData,
       });
