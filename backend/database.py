@@ -1,19 +1,18 @@
 import os
 from sqlalchemy import create_engine
-from urllib.parse import quote_plus
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Render ya environment variable se DATABASE_URL le, warna local fallback use kare
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    password = "aadarsh@01"
-    DATABASE_URL = f"postgresql://postgres:{quote_plus(password)}@localhost:5432/careeriq"
+# Render ya local par SQLite database use karein
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sql_app.db")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+# SQLite ke liye check_same_thread zaroori hota hai
+if "sqlite" in DATABASE_URL:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(
     autocommit=False,
