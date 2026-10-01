@@ -21,9 +21,10 @@ app = FastAPI(
 )
 
 # CORS Middleware Setup
+# CORS Middleware Setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],  # Sabhi domains (Vercel frontend) ko allow karega
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
