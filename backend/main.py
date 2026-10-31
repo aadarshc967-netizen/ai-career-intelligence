@@ -1,71 +1,92 @@
-from datetime import datetime, timedelta
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
-from pypdf import PdfReader
-from docx import Document
-from sqlalchemy.orm import Session
-from sqlalchemy import Column, Integer, String, DateTime
-from passlib.context import CryptContext
-from jose import jwt
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from database import engine, Base, SessionLocal
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from pydantic import BaseModel, Field
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from database import Base, SessionLocal, engine
+from models.resume_history import ResumeHistory
 from models.user import User
+from resume_analysis import (
+    analyze_ats,
+    calculate_role_match,
+    extract_resume,
+    extract_skills,
+    jd_keywords,
+)
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".pdf", ".docx"}
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+    raise RuntimeError("Set JWT_SECRET_KEY to a secret of at least 32 characters")
 
 app = FastAPI(
     title="AI Career Intelligence API",
-    description="Backend API for AI-powered career analysis",
-    version="1.0.0"
+    description="Resume diagnostics, job matching, and career history",
+    version="2.0.0",
 )
 
-# CORS Middleware Setup
-# CORS Middleware Setup
+configured_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Sabhi domains (Vercel frontend) ko allow karega
+    allow_origins=[origin.strip() for origin in configured_origins.split(",") if origin.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+bearer_scheme = HTTPBearer(auto_error=False)
 
-# JWT Security Configurations
-SECRET_KEY = "super-secret-key-ai-career-intelligence"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-# Resume History Model for Dashboard History Tracking
-class ResumeHistoryModel(Base):
-    __tablename__ = "resume_histories"
-    id = Column(Integer, primary_key=True, index=True)
-    user_email = Column(String, index=True)
-    filename = Column(String)
-    target_role = Column(String)
-    match_score = Column(Integer)
-    resume_score = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Initialize Database tables (Yeh sabhi models ke define hone ke baad chalna chahiye)
-Base.metadata.create_all(bind=engine)
-
-# Pydantic Models
 class RegisterRequest(BaseModel):
-    name: str
-    email: str
-    password: str
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=128)
 
-# Dependency to get DB session
+
+def migrate_history_columns() -> None:
+    existing_columns = {column["name"] for column in inspect(engine).get_columns("resume_histories")}
+    column_types = {
+        "skill_gaps": "TEXT NOT NULL DEFAULT '[]'",
+        "action_roadmap": "TEXT NOT NULL DEFAULT '[]'",
+        "ats_score": "INTEGER NOT NULL DEFAULT 0",
+        "keyword_heatmap": "TEXT NOT NULL DEFAULT '[]'",
+        "ats_issues": "TEXT NOT NULL DEFAULT '[]'",
+        "tailored_bullets": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    with engine.begin() as connection:
+        for column, definition in column_types.items():
+            if column not in existing_columns:
+                connection.execute(text(f"ALTER TABLE resume_histories ADD COLUMN {column} {definition}"))
+
+
+Base.metadata.create_all(bind=engine)
+migrate_history_columns()
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -73,263 +94,306 @@ def get_db():
     finally:
         db.close()
 
+
+def normalize_email(email: str) -> str:
+    normalized = email.strip().casefold()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(status_code=422, detail="A valid email address is required")
+    return normalized
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 260_000)
+    return f"pbkdf2_sha256${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _, salt_hex, digest_hex = stored_hash.split("$")
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 260_000)
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(stored_hash.encode("utf-8"), password.encode("utf-8"))
+
+
+def create_access_token(email: str) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    return jwt.encode({"sub": email, "exp": expires_at}, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication is required")
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+    except JWTError as error:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token") from error
+    if not isinstance(email, str):
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Account no longer exists")
+    return user
+
+
+def parse_json_list(value: str) -> list:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 @app.get("/")
 def root():
-    return {
-        "message": "AI Career Intelligence API is running"
-    }
+    return {"message": "AI Career Intelligence API is running"}
+
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "service": "AI Career Intelligence API"
-    }
+    return {"status": "healthy", "service": "AI Career Intelligence API"}
+
 
 @app.post("/register")
 def register_user(data: RegisterRequest, db: Session = Depends(get_db)):
-    existing_user = db.query(User).filter(User.email == data.email).first()
-
-    if existing_user:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered"
-        )
-
-    user = User(
-        name=data.name,
-        email=data.email,
-        password_hash=data.password
-    )
-
+    email = normalize_email(data.email)
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="A name is required")
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    user = User(name=name, email=email, password_hash=hash_password(data.password))
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered") from error
     db.refresh(user)
-
     return {
-        "message": "User registered successfully",
-        "user_id": user.id,
-        "name": user.name,
-        "email": user.email
-    }
-
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-@app.post("/login")
-def login_user(data: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == data.email).first()
-    
-    if not user or user.password_hash != data.password:
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
-    
-    return {
-        "access_token": access_token,
+        "access_token": create_access_token(user.email),
         "token_type": "bearer",
         "user_id": user.id,
         "name": user.name,
-        "email": user.email
+        "email": user.email,
     }
+
+
+@app.post("/login")
+def login_user(data: LoginRequest, db: Session = Depends(get_db)):
+    email = normalize_email(data.email)
+    user = db.query(User).filter(User.email == email).first()
+    if user is None or not verify_password(data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    if not user.password_hash.startswith("pbkdf2_sha256$"):
+        user.password_hash = hash_password(data.password)
+        db.commit()
+    return {
+        "access_token": create_access_token(user.email),
+        "token_type": "bearer",
+        "user_id": user.id,
+        "name": user.name,
+        "email": user.email,
+    }
+
+
+async def read_resume(file: UploadFile) -> tuple[str, str, list[str], int]:
+    extension = Path(file.filename or "").suffix.casefold()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are allowed")
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded resume is empty")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File size must be less than 5MB")
+    try:
+        resume_text, layout_issues = extract_resume(content, extension)
+    except (ValueError, OSError, KeyError) as error:
+        raise HTTPException(status_code=422, detail="The resume file is invalid or could not be parsed") from error
+    if not resume_text.strip():
+        raise HTTPException(status_code=422, detail="No readable text was found in the resume")
+    return resume_text, Path(file.filename or "resume").name[:255], layout_issues, len(content)
+
 
 @app.post("/upload-resume")
-async def upload_resume(file: UploadFile = File(...)):
-    allowed_types = [
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ]
-
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF and DOCX files are allowed"
-        )
-
-    file_path = UPLOAD_DIR / file.filename
-    content = await file.read()
-
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail="File size must be less than 5MB"
-        )
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-        
-    resume_text = extract_text(file_path)
-    skills = extract_skills(resume_text)
-
+async def upload_resume(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    resume_text, filename, _, size = await read_resume(file)
     return {
-        "message": "Resume uploaded successfully",
-        "filename": file.filename,
-        "size": len(content),
+        "message": "Resume uploaded and parsed successfully",
+        "filename": filename,
+        "size": size,
         "text": resume_text,
-        "skills": skills
+        "skills": extract_skills(resume_text),
     }
+
+
+def role_skills(target_role: str) -> list[str]:
+    requirements = {
+        "Python Backend Developer": [
+            "Python", "SQL", "Git", "FastAPI", "Django", "Flask", "PostgreSQL", "MySQL", "MongoDB",
+        ],
+        "Full-Stack Developer": [
+            "JavaScript", "HTML", "CSS", "Git", "React", "TypeScript", "Node.js", "SQL", "MongoDB",
+        ],
+        "Junior Data Scientist / ML Engineer": [
+            "Python", "SQL", "Pandas", "NumPy", "TensorFlow", "PyTorch", "Machine Learning",
+            "Artificial Intelligence", "Data Science",
+        ],
+    }
+    return requirements.get(target_role, requirements["Python Backend Developer"])
+
+
+async def tailor_bullets(resume_text: str, job_description: str) -> list[str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="JD tailoring requires OPENAI_API_KEY to be configured")
+
+    endpoint = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "temperature": 0.2,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Improve resume bullet points for relevance to the supplied job description. "
+                    "Return only a JSON object with a 'bullets' array of rewritten bullet strings. "
+                    "Do not invent employers, skills, metrics, achievements, or qualifications. "
+                    "Preserve the candidate's factual claims and use concise action-oriented language."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Job description:\n{job_description}\n\nResume:\n{resume_text[:18000]}",
+            },
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    def request_completion() -> dict:
+        request = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        response_data = await asyncio.to_thread(request_completion)
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"LLM provider rejected the tailoring request (HTTP {error.code})") from error
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail="The LLM provider could not complete the tailoring request") from error
+
+    try:
+        content = response_data["choices"][0]["message"]["content"]
+        bullets = json.loads(content)["bullets"]
+        if not isinstance(bullets, list) or not bullets or not all(isinstance(item, str) and item.strip() for item in bullets):
+            raise ValueError("Invalid bullets")
+        return [item.strip()[:1000] for item in bullets[:20]]
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail="The LLM provider returned an invalid tailoring response") from error
+
 
 @app.post("/analyze-career")
 async def analyze_career(
-    file: UploadFile = File(...), 
-    target_role: str = Form("Python Backend Developer"),
-    user_email: str = Form("guest@example.com"),
-    db: Session = Depends(get_db)
+    file: UploadFile = File(...),
+    target_role: str = Form("Python Backend Developer", max_length=200),
+    job_description: str = Form("", max_length=20_000),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    allowed_types = [
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ]
-
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF and DOCX files are allowed"
-        )
-
-    file_path = UPLOAD_DIR / file.filename
-    content = await file.read()
-
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail="File size must be less than 5MB"
-        )
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-        
-    resume_text = extract_text(file_path)
+    if job_description.strip() and not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=503, detail="JD tailoring requires OPENAI_API_KEY to be configured")
+    resume_text, filename, layout_issues, _ = await read_resume(file)
+    role_keywords = role_skills(target_role)
+    target_keywords = jd_keywords(job_description) if job_description.strip() else role_keywords
+    match_score, skill_gaps = calculate_role_match(resume_text, target_keywords)
+    ats_analysis = analyze_ats(resume_text, filename, target_keywords, layout_issues)
+    resume_score = round(ats_analysis["score"] * 0.65 + match_score * 0.35)
     skills = extract_skills(resume_text)
-
-    # Distinct Role-Specific Skill Requirements & Weightage
-    role_requirements = {
-        "Python Backend Developer": {
-            "core": ["Python", "SQL", "Git"],
-            "frameworks": ["FastAPI", "Django", "Flask"],
-            "database": ["PostgreSQL", "MySQL", "MongoDB"]
-        },
-        "Full-Stack Developer": {
-            "core": ["JavaScript", "HTML", "CSS", "Git"],
-            "frameworks": ["React", "TypeScript", "Node.js"],
-            "database": ["SQL", "MongoDB"]
-        },
-        "Junior Data Scientist / ML Engineer": {
-            "core": ["Python", "SQL"],
-            "frameworks": ["Pandas", "NumPy", "TensorFlow", "PyTorch"],
-            "database": ["Machine Learning", "Artificial Intelligence", "Data Science"]
-        }
-    }
-
-    # Get requirement groups for the selected target role
-    selected_reqs = role_requirements.get(target_role, role_requirements["Python Backend Developer"])
-    
-    all_role_skills = selected_reqs["core"] + selected_reqs["frameworks"] + selected_reqs["database"]
-    
-    # Calculate intelligent match score based on presence in resume
-    matched_skills_count = sum(1 for skill in all_role_skills if skill in skills)
-    match_percentage = int((matched_skills_count / len(all_role_skills)) * 100)
-    # Ensure reasonable percentage bounds
-    match_percentage = max(25, min(match_percentage, 96))
-
-    # Dynamic Resume Health Score based on skill variety and tools
-    resume_score = min(35 + (len(skills) * 9) + (10 if "Git" in skills else 0) + (10 if "SQL" in skills else 0), 98)
-
-    # Find missing skills specifically for this target role
-    missing_skills = [s for s in all_role_skills if s not in skills]
-    
-    # Role-specific tailored roadmap
     roadmap = [
-        f"Step 1: Bridge critical skill gaps for {target_role} by learning: {', '.join(missing_skills[:3]) if missing_skills else 'advanced architecture'}.",
-        f"Step 2: Build 2 high-impact production projects specifically targeting {target_role}.",
-        "Step 3: Optimize code efficiency, write clean unit tests, and document architecture professionally.",
-        "Step 4: Practice system design problems and mock interviews tailored to top tech companies."
+        f"Build evidence for these priority skills: {', '.join(skill_gaps[:3])}." if skill_gaps else "Deepen your expertise in the skills most emphasized by the target role.",
+        f"Create two measurable projects demonstrating fit for {target_role}.",
+        "Rewrite experience bullets with clear actions, scope, and truthful measurable outcomes.",
+        "Review the ATS findings and retest after updating the resume.",
     ]
+    tailored = []
+    if job_description.strip():
+        tailored = await tailor_bullets(resume_text, job_description)
 
-    dos_and_donts = {
-        "dos": [
-            f"Highlight projects and experience specifically related to {target_role}.",
-            "Use clear action verbs and quantifiable impact metrics in your experience bullet points.",
-            "Ensure core tools like Git and relevant frameworks are prominently featured at the top."
-        ],
-        "donts": [
-            "Avoid listing irrelevant technologies that do not align with your chosen target role.",
-            "Do not use generic templates without customizing skills to match the job description.",
-            "Avoid walls of text; keep descriptions concise and impact-driven."
-        ]
-    }
-
-    # Save Analysis History to Database
-    new_history = ResumeHistoryModel(
-        user_email=user_email,
-        filename=file.filename,
-        target_role=target_role,
-        match_score=match_percentage,
-        resume_score=resume_score
+    history = ResumeHistory(
+        user_email=user.email,
+        filename=filename,
+        target_role=target_role[:200],
+        match_score=match_score,
+        resume_score=resume_score,
+        skill_gaps=json.dumps(skill_gaps),
+        action_roadmap=json.dumps(roadmap),
+        ats_score=ats_analysis["score"],
+        keyword_heatmap=json.dumps(ats_analysis["keyword_heatmap"]),
+        ats_issues=json.dumps(ats_analysis["issues"]),
+        tailored_bullets=json.dumps(tailored),
     )
-    db.add(new_history)
+    db.add(history)
     db.commit()
 
     return {
-        "filename": file.filename,
+        "filename": filename,
         "extracted_skills": skills,
         "target_role": target_role,
-        "match_score": match_percentage,
+        "match_score": match_score,
         "resume_score": resume_score,
-        "current_suitability": [target_role, "Software Engineer Intern"],
-        "skill_gaps": missing_skills,
+        "ats_analysis": ats_analysis,
+        "skill_gaps": skill_gaps,
         "future_action_plan": roadmap,
-        "dos_and_donts": dos_and_donts
+        "tailored_bullets": tailored,
     }
 
+
 @app.get("/user-history/{email}")
-def get_user_history(email: str, db: Session = Depends(get_db)):
-    history = db.query(ResumeHistoryModel).filter(ResumeHistoryModel.user_email == email).all()
-    return history
-
-def extract_text(file_path: Path):
-    if file_path.suffix.lower() == ".pdf":
-        reader = PdfReader(str(file_path))
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-        return text
-
-    elif file_path.suffix.lower() == ".docx":
-        document = Document(str(file_path))
-        text = ""
-        for paragraph in document.paragraphs:
-            text += paragraph.text + "\n"
-        return text
-
-    return ""
-
-def extract_skills(text: str):
-    skills_list = [
-        "Python", "Java", "C", "C++", "JavaScript", "TypeScript", "React",
-        "Node.js", "HTML", "CSS", "SQL", "MySQL", "PostgreSQL", "MongoDB",
-        "Git", "GitHub", "Docker", "Machine Learning", "Deep Learning",
-        "Artificial Intelligence", "Data Science", "Pandas", "NumPy",
-        "TensorFlow", "PyTorch", "FastAPI", "Django", "Flask"
+def get_user_history(
+    email: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if normalize_email(email) != user.email.casefold():
+        raise HTTPException(status_code=403, detail="You may only access your own analysis history")
+    history = (
+        db.query(ResumeHistory)
+        .filter(ResumeHistory.user_email == user.email)
+        .order_by(ResumeHistory.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return [
+        {
+            "id": item.id,
+            "filename": item.filename,
+            "target_role": item.target_role,
+            "match_score": item.match_score,
+            "resume_score": item.resume_score,
+            "ats_score": item.ats_score,
+            "skill_gaps": parse_json_list(item.skill_gaps),
+            "action_roadmap": parse_json_list(item.action_roadmap),
+            "keyword_heatmap": parse_json_list(item.keyword_heatmap),
+            "ats_issues": parse_json_list(item.ats_issues),
+            "tailored_bullets": parse_json_list(item.tailored_bullets),
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        }
+        for item in history
     ]
-
-    text_lower = text.lower()
-    found_skills = []
-
-    for skill in skills_list:
-        if skill.lower() in text_lower:
-            found_skills.append(skill)
-
-    return found_skills
