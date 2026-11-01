@@ -1,47 +1,32 @@
-import { Routes, Route } from 'react-router-dom'
+import { Link, Navigate, Route, Routes } from 'react-router-dom'
 import ResumeUpload from './pages/ResumeUpload'
 
 function Home() {
   return (
     <div className="min-h-screen bg-slate-950 text-white">
-      <nav className="border-b border-slate-800 px-8 py-5">
+      <nav className="border-b border-slate-800 px-5 py-5 md:px-8">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
-          <h1 className="text-xl font-bold">🧠 CareerIQ</h1>
-
-          <div className="flex gap-6 text-sm text-slate-300">
-            <a href="/">Home</a>
-            <a href="/resume">Resume</a>
-            <a href="/dashboard">Dashboard</a>
+          <Link to="/" className="text-xl font-bold">CareerIQ</Link>
+          <div className="flex gap-5 text-sm text-slate-300">
+            <Link to="/" className="hover:text-white">Home</Link>
+            <Link to="/resume" className="hover:text-white">Resume analysis</Link>
           </div>
-
-          <button className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium">
-            Profile
-          </button>
         </div>
       </nav>
-
-      <main className="mx-auto max-w-7xl px-8 py-16">
-        <p className="mb-4 text-sm font-medium text-blue-400">
-          AI CAREER INTELLIGENCE
-        </p>
-
-        <h2 className="text-5xl font-bold leading-tight">
-          Build the career
-          <br />
-          you're aiming for.
-        </h2>
-
+      <main className="mx-auto max-w-7xl px-5 py-16 md:px-8 md:py-24">
+        <p className="mb-4 text-sm font-semibold tracking-widest text-blue-400">AI CAREER INTELLIGENCE</p>
+        <h1 className="max-w-3xl text-4xl font-bold leading-tight md:text-6xl">
+          Build the career you&apos;re aiming for.
+        </h1>
         <p className="mt-6 max-w-2xl text-lg text-slate-400">
-          Analyze your resume, discover skill gaps and get a
-          personalized career roadmap powered by AI.
+          Analyze your resume, find skill gaps, compare a target job description, and build a personalized career roadmap.
         </p>
-
-        <a
-          href="/resume"
+        <Link
+          to="/resume"
           className="mt-8 inline-block rounded-xl bg-blue-600 px-6 py-3 font-semibold hover:bg-blue-500"
         >
-          Analyze My Resume
-        </a>
+          Analyze my resume
+        </Link>
       </main>
     </div>
   )
@@ -49,19 +34,23 @@ function Home() {
 
 function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/resume" element={<ResumeUpload />} />
-
-      <Route
-        path="/dashboard"
-        element={
-          <div className="min-h-screen bg-slate-950 p-10 text-white">
-            Dashboard coming soon...
+    <div className="min-h-screen bg-slate-100">
+      <header className="border-b border-slate-200 bg-white px-5 py-4">
+        <nav className="mx-auto flex max-w-5xl items-center justify-between">
+          <Link to="/" className="font-bold text-slate-900">CareerIQ</Link>
+          <div className="flex gap-5 text-sm font-medium text-slate-600">
+            <Link to="/" className="hover:text-blue-700">Home</Link>
+            <Link to="/resume" className="hover:text-blue-700">Resume analysis</Link>
           </div>
-        }
-      />
-    </Routes>
+        </nav>
+      </header>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/resume" element={<ResumeUpload />} />
+        <Route path="/dashboard" element={<Navigate to="/resume" replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </div>
   )
 }
 

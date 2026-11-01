@@ -1,255 +1,506 @@
-import React, { useState, useEffect } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { apiRequest } from '../lib/api'
 
-const API_BASE_URL = "https://ai-career-intelligence-7x5r.onrender.com";
+const MAX_FILE_SIZE = 5 * 1024 * 1024
+
+type KeywordDiagnostic = {
+  term: string
+  mentions: number
+  density_percent: number
+  benchmark_percent: string
+  status: 'missing' | 'low' | 'high' | 'within_benchmark'
+}
+
+type AnalysisResult = {
+  filename: string
+  extracted_skills: string[]
+  target_role: string
+  match_score: number
+  resume_score: number
+  ats_analysis: {
+    score: number
+    word_count: number
+    issues: string[]
+    keyword_heatmap: KeywordDiagnostic[]
+    benchmark_note: string
+  }
+  skill_gaps: string[]
+  future_action_plan: string[]
+  tailored_bullets: string[]
+}
+
+type HistoryItem = {
+  id: number
+  filename: string
+  target_role: string
+  match_score: number
+  resume_score: number
+  ats_score: number
+  skill_gaps: string[]
+  action_roadmap: string[]
+  keyword_heatmap: KeywordDiagnostic[]
+  ats_issues: string[]
+  tailored_bullets: string[]
+  created_at: string | null
+}
+
+type AuthResponse = {
+  access_token: string
+  name: string
+  email: string
+}
+
+function keywordStatus(status: KeywordDiagnostic['status']): string {
+  switch (status) {
+    case 'missing':
+      return 'Missing'
+    case 'low':
+      return 'Low'
+    case 'high':
+      return 'High'
+    case 'within_benchmark':
+      return 'On target'
+  }
+}
 
 export default function ResumeUpload() {
-  const [file, setFile] = useState<File | null>(null);
-  const [targetRole, setTargetRole] = useState("Python Backend Developer");
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notification, setNotification] = useState<string | null>(null);
-  const [history, setHistory] = useState<any[]>([]);
-
-  const userName = localStorage.getItem("userName") || "Aadarsh";
-  const userEmail = localStorage.getItem("userEmail") || "aadarsh@example.com";
+  const [token, setToken] = useState(() => localStorage.getItem('accessToken') ?? '')
+  const [userName, setUserName] = useState(() => localStorage.getItem('userName') ?? '')
+  const [userEmail, setUserEmail] = useState(() => localStorage.getItem('userEmail') ?? '')
+  const [registering, setRegistering] = useState(false)
+  const [nameInput, setNameInput] = useState('')
+  const [emailInput, setEmailInput] = useState(userEmail)
+  const [password, setPassword] = useState('')
+  const [file, setFile] = useState<File | null>(null)
+  const [targetRole, setTargetRole] = useState('Python Backend Developer')
+  const [jobDescription, setJobDescription] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [authLoading, setAuthLoading] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [result, setResult] = useState<AnalysisResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [history, setHistory] = useState<HistoryItem[]>([])
+  const authInFlight = useRef(false)
+  const analysisInFlight = useRef(false)
 
   useEffect(() => {
-    fetchHistory();
-  }, []);
-
-  const fetchHistory = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/user-history/${userEmail}`);
-      if (response.ok) {
-        const data = await response.json();
-        setHistory(data);
+    if (!token || !userEmail) return
+    let active = true
+    const fetchHistory = async () => {
+      setHistoryLoading(true)
+      try {
+        const data = await apiRequest<HistoryItem[]>(
+          `/user-history/${encodeURIComponent(userEmail)}`,
+          { token },
+        )
+        if (!Array.isArray(data)) throw new Error('The history response was invalid.')
+        if (active) setHistory(data)
+      } catch (requestError) {
+        if (active) {
+          setError(requestError instanceof Error ? requestError.message : 'Unable to load analysis history.')
+        }
+      } finally {
+        if (active) setHistoryLoading(false)
       }
-    } catch (err) {
-      console.error("Failed to fetch history", err);
     }
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
-      setError(null);
+    void fetchHistory()
+    return () => {
+      active = false
     }
-  };
+  }, [token, userEmail])
 
-  const handleUpload = async () => {
-    if (!file) {
-      setError("Please select a PDF or DOCX file first.");
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("target_role", targetRole);
-    formData.append("user_email", userEmail);
-
-    setLoading(true);
-    setError(null);
-    setNotification(null);
-
+  const handleAuthentication = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (authInFlight.current) return
+    authInFlight.current = true
+    setError(null)
+    setAuthLoading(true)
     try {
-      const response = await fetch(`${API_BASE_URL}/analyze-career`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to analyze resume. Please check file format or size.");
-      }
-
-      const data = await response.json();
-      setResult(data);
-      
-      // Success Notification format
-      setNotification(`${userName}, your resume analyzing completed! 🎉`);
-      
-      fetchHistory();
-    } catch (err: any) {
-      setError(err.message || "An error occurred while connecting to backend.");
+      const data = await apiRequest<AuthResponse>(`/${registering ? 'register' : 'login'}`, {
+        method: 'POST',
+        json: {
+          ...(registering ? { name: nameInput } : {}),
+          email: emailInput,
+          password,
+        },
+      })
+      localStorage.setItem('accessToken', data.access_token)
+      localStorage.setItem('userName', data.name)
+      localStorage.setItem('userEmail', data.email)
+      setToken(data.access_token)
+      setUserName(data.name)
+      setUserEmail(data.email)
+      setPassword('')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Unable to authenticate.')
     } finally {
-      setLoading(false);
+      authInFlight.current = false
+      setAuthLoading(false)
     }
-  };
+  }
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0]
+    setError(null)
+    if (!selected) {
+      setFile(null)
+      return
+    }
+    if (!/\.(pdf|docx)$/i.test(selected.name)) {
+      setFile(null)
+      setError('Choose a PDF or DOCX resume.')
+      event.target.value = ''
+      return
+    }
+    if (selected.size > MAX_FILE_SIZE) {
+      setFile(null)
+      setError('The resume must be smaller than 5 MiB.')
+      event.target.value = ''
+      return
+    }
+    setFile(selected)
+  }
+
+  const handleUpload = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (analysisInFlight.current) return
+    if (!file) {
+      setError('Please select a PDF or DOCX file first.')
+      return
+    }
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('target_role', targetRole)
+    formData.append('job_description', jobDescription)
+
+    analysisInFlight.current = true
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await apiRequest<AnalysisResult>('/analyze-career', {
+        method: 'POST',
+        token,
+        body: formData,
+      })
+      setResult(data)
+      try {
+        const updatedHistory = await apiRequest<HistoryItem[]>(
+          `/user-history/${encodeURIComponent(userEmail)}`,
+          { token },
+        )
+        if (!Array.isArray(updatedHistory)) throw new Error('The history response was invalid.')
+        setHistory(updatedHistory)
+      } catch (historyError) {
+        setError(
+          `Analysis completed, but history could not be refreshed: ${
+            historyError instanceof Error ? historyError.message : 'Please reload history.'
+          }`,
+        )
+      }
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Unable to analyze this resume.')
+    } finally {
+      analysisInFlight.current = false
+      setLoading(false)
+    }
+  }
+
+  const logout = () => {
+    localStorage.removeItem('accessToken')
+    localStorage.removeItem('userName')
+    localStorage.removeItem('userEmail')
+    setToken('')
+    setUserName('')
+    setUserEmail('')
+    setHistory([])
+    setResult(null)
+  }
+
+  if (!token) {
+    return (
+      <main className="mx-auto mt-12 max-w-lg px-5 pb-12">
+        <section className="rounded-2xl bg-white p-8 shadow-lg">
+          <p className="text-sm font-bold uppercase tracking-widest text-blue-600">CareerIQ account</p>
+          <h1 className="mt-2 text-3xl font-bold text-slate-900">
+            {registering ? 'Create your account' : 'Welcome back'}
+          </h1>
+          <p className="mt-2 text-sm text-slate-600">
+            Sign in to securely analyze resumes and access your private history.
+          </p>
+          <form onSubmit={handleAuthentication} className="mt-6 space-y-4">
+            {registering && (
+              <label className="block text-sm font-medium text-slate-700">
+                Name
+                <input
+                  required
+                  maxLength={120}
+                  autoComplete="name"
+                  value={nameInput}
+                  onChange={(event) => setNameInput(event.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-300 p-3"
+                />
+              </label>
+            )}
+            <label className="block text-sm font-medium text-slate-700">
+              Email
+              <input
+                required
+                type="email"
+                maxLength={254}
+                autoComplete="email"
+                value={emailInput}
+                onChange={(event) => setEmailInput(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 p-3"
+              />
+            </label>
+            <label className="block text-sm font-medium text-slate-700">
+              Password
+              <input
+                required
+                type="password"
+                minLength={registering ? 8 : 1}
+                maxLength={128}
+                autoComplete={registering ? 'new-password' : 'current-password'}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 p-3"
+              />
+            </label>
+            {error && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+            <button
+              type="submit"
+              disabled={authLoading}
+              className="w-full rounded-lg bg-blue-600 px-4 py-3 font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
+            >
+              {authLoading ? 'Please wait…' : registering ? 'Create account' : 'Sign in'}
+            </button>
+          </form>
+          <button
+            type="button"
+            onClick={() => {
+              setRegistering(!registering)
+              setError(null)
+            }}
+            className="mt-4 w-full text-sm font-medium text-blue-700 hover:underline"
+          >
+            {registering ? 'Already have an account? Sign in' : 'New here? Create an account'}
+          </button>
+        </section>
+      </main>
+    )
+  }
 
   return (
-    <div className="p-8 max-w-4xl mx-auto space-y-8 mt-6">
-      {/* Welcome Banner */}
-      <div className="bg-gradient-to-r from-blue-600 to-indigo-700 p-6 rounded-2xl text-white shadow-lg flex justify-between items-center">
+    <main className="mx-auto mt-8 max-w-5xl space-y-6 px-5 pb-12">
+      <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl bg-gradient-to-r from-blue-700 to-indigo-700 p-6 text-white shadow-lg">
         <div>
-          <h1 className="text-2xl font-bold">Welcome back, {userName}! 👋</h1>
-          <p className="text-sm text-blue-100 mt-1">Manage your career intelligence and track your past resume analyses.</p>
+          <p className="text-sm font-medium text-blue-100">Your career intelligence workspace</p>
+          <h1 className="mt-1 text-2xl font-bold">Welcome, {userName}</h1>
+          <p className="mt-1 text-sm text-blue-100">{userEmail}</p>
         </div>
-        <div className="bg-white/10 px-4 py-2 rounded-lg text-xs font-semibold backdrop-blur-md">
-          {userEmail}
-        </div>
-      </div>
-
-      {/* Notification Alert */}
-      {notification && (
-        <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl font-medium shadow-sm flex items-center justify-between">
-          <span>✨ {notification}</span>
-          <button onClick={() => setNotification(null)} className="text-xs text-emerald-600 font-bold hover:underline">Dismiss</button>
-        </div>
-      )}
-
-      {/* Upload Card */}
-      <div className="bg-white p-8 rounded-2xl shadow-md space-y-6">
-        <div className="flex justify-between items-center">
-          <div>
-            <h2 className="text-xl font-bold text-gray-800">Upload & Analyze New Resume</h2>
-            <p className="text-xs text-gray-500">Select your target role and get instant AI diagnostics.</p>
-          </div>
-          {result && (
-            <button 
-              onClick={() => window.print()}
-              className="px-4 py-2 bg-gray-800 text-white text-xs font-semibold rounded-lg hover:bg-gray-900 transition"
-            >
-              🖨️ Print Report
-            </button>
-          )}
-        </div>
-
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-1">Select Target Role:</label>
-            <select 
-              value={targetRole} 
-              onChange={(e) => setTargetRole(e.target.value)}
-              className="w-full p-3 border border-gray-300 rounded-xl bg-gray-50 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-            >
-              <option value="Python Backend Developer">Python Backend Developer</option>
-              <option value="Full-Stack Developer">Full-Stack Developer</option>
-              <option value="Junior Data Scientist / ML Engineer">Junior Data Scientist / ML Engineer</option>
-            </select>
-          </div>
-
-          <div className="border-2 border-dashed border-gray-300 p-6 rounded-xl text-center bg-gray-50">
-            <input 
-              type="file" 
-              accept=".pdf,.docx" 
-              onChange={handleFileChange} 
-              className="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer"
-            />
-            {file && <p className="mt-2 text-sm text-green-600 font-medium">Selected: {file.name}</p>}
-          </div>
-        </div>
-
-        <button 
-          onClick={handleUpload} 
-          disabled={loading}
-          className="w-full py-3 px-4 bg-blue-600 text-white font-semibold rounded-xl shadow-md hover:bg-blue-700 disabled:bg-gray-400 transition"
-        >
-          {loading ? "Analyzing Career Readiness..." : "Upload & Analyze"}
+        <button onClick={logout} className="rounded-lg border border-white/50 px-4 py-2 text-sm hover:bg-white/10">
+          Sign out
         </button>
+      </section>
 
-        {error && <p className="text-red-500 text-sm bg-red-50 p-3 rounded">{error}</p>}
-      </div>
-
-      {/* Current Result Section with FULL Details */}
-      {result && (
-        <div className="bg-white p-8 rounded-2xl shadow-md space-y-6">
-          <h3 className="text-xl font-bold text-gray-800">Latest Analysis Report</h3>
-          
-          <div className="grid grid-cols-2 gap-4">
-            <div className="p-4 bg-indigo-50 rounded-xl border border-indigo-100 text-center">
-              <h4 className="text-xs uppercase font-bold text-indigo-600 tracking-wider">Role Match Score</h4>
-              <p className="text-3xl font-extrabold text-indigo-900 mt-1">{result.match_score}%</p>
-            </div>
-            <div className="p-4 bg-emerald-50 rounded-xl border border-emerald-100 text-center">
-              <h4 className="text-xs uppercase font-bold text-emerald-600 tracking-wider">Resume Health Score</h4>
-              <p className="text-3xl font-extrabold text-emerald-900 mt-1">{result.resume_score}/100</p>
-            </div>
-          </div>
-
-          <div className="p-5 bg-blue-50 rounded-xl border border-blue-100">
-            <h4 className="font-semibold text-blue-900">Extracted Technical Skills</h4>
-            <div className="flex flex-wrap gap-2 mt-2">
-              {result.extracted_skills.map((skill: string, idx: number) => (
-                <span key={idx} className="px-3 py-1 bg-blue-600 text-white text-xs font-medium rounded-full">{skill}</span>
-              ))}
-            </div>
-          </div>
-
-          <div className="p-5 bg-green-50 rounded-xl border border-green-100">
-            <h4 className="font-semibold text-green-900">Target Role Fit</h4>
-            <p className="text-xs text-green-700 mt-0.5">Targeting: <strong>{result.target_role}</strong></p>
-            <ul className="list-disc list-inside mt-2 text-sm text-green-800 space-y-1">
-              {result.current_suitability.map((role: string, idx: number) => (
-                <li key={idx} className="font-medium">{role}</li>
-              ))}
-            </ul>
-          </div>
-
-          <div className="p-5 bg-amber-50 rounded-xl border border-amber-100">
-            <h4 className="font-semibold text-amber-900">Missing Skill Gaps for this Role</h4>
-            <ul className="list-disc list-inside mt-2 text-sm text-amber-800 space-y-1">
-              {result.skill_gaps.length > 0 ? result.skill_gaps.map((gap: string, i: number) => <li key={i}>{gap}</li>) : <li>No gaps found!</li>}
-            </ul>
-          </div>
-
-          <div className="p-5 bg-purple-50 rounded-xl border border-purple-100">
-            <h4 className="font-semibold text-purple-900">Customized Action Plan & Roadmap</h4>
-            <ol className="list-decimal list-inside mt-2 text-sm text-purple-800 space-y-2">
-              {result.future_action_plan.map((step: string, idx: number) => (
-                <li key={idx} className="font-medium">{step}</li>
-              ))}
-            </ol>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="p-5 bg-teal-50 rounded-xl border border-teal-100">
-              <h4 className="font-semibold text-teal-900 mb-2">✅ What to Do (Best Practices)</h4>
-              <ul className="list-disc list-inside text-xs text-teal-800 space-y-2">
-                {result.dos_and_donts.dos.map((item: string, idx: number) => (
-                  <li key={idx}>{item}</li>
-                ))}
-              </ul>
-            </div>
-            <div className="p-5 bg-rose-50 rounded-xl border border-rose-100">
-              <h4 className="font-semibold text-rose-900 mb-2">❌ What to Avoid (Mistakes)</h4>
-              <ul className="list-disc list-inside text-xs text-rose-800 space-y-2">
-                {result.dos_and_donts.donts.map((item: string, idx: number) => (
-                  <li key={idx}>{item}</li>
-                ))}
-              </ul>
-            </div>
-          </div>
+      {error && (
+        <div role="alert" className="flex items-start justify-between gap-4 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+          <span>{error}</span>
+          <button onClick={() => setError(null)} className="font-semibold underline">Dismiss</button>
         </div>
       )}
 
-      {/* Past History Dashboard Section */}
-      <div className="bg-white p-8 rounded-2xl shadow-md space-y-4">
-        <h3 className="text-xl font-bold text-gray-800">Your Analysis History ({history.length})</h3>
-        {history.length === 0 ? (
-          <p className="text-sm text-gray-500">No past analysis history found. Upload a resume above!</p>
-        ) : (
-          <div className="space-y-3">
-            {history.map((item, index) => (
-              <div key={index} className="p-4 bg-gray-50 rounded-xl border border-gray-200 flex justify-between items-center">
-                <div>
-                  <p className="font-semibold text-gray-800 text-sm">{item.filename}</p>
-                  <p className="text-xs text-gray-500">Target Role: <span className="font-medium text-blue-600">{item.target_role}</span></p>
-                </div>
-                <div className="flex gap-4 text-right">
-                  <div>
-                    <p className="text-xs text-gray-400">Match</p>
-                    <p className="text-sm font-bold text-indigo-600">{item.match_score}%</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-400">Health</p>
-                    <p className="text-sm font-bold text-emerald-600">{item.resume_score}/100</p>
-                  </div>
-                </div>
+      <form onSubmit={handleUpload} className="space-y-5 rounded-2xl bg-white p-6 shadow-md md:p-8">
+        <div>
+          <h2 className="text-xl font-bold text-slate-900">Analyze your resume</h2>
+          <p className="mt-1 text-sm text-slate-600">Get role fit, ATS diagnostics, and keyword coverage.</p>
+        </div>
+        <label className="block text-sm font-semibold text-slate-700">
+          Target role
+          <select
+            value={targetRole}
+            onChange={(event) => setTargetRole(event.target.value)}
+            className="mt-1 w-full rounded-lg border border-slate-300 bg-slate-50 p-3"
+          >
+            <option>Python Backend Developer</option>
+            <option>Full-Stack Developer</option>
+            <option>Junior Data Scientist / ML Engineer</option>
+          </select>
+        </label>
+        <label className="block text-sm font-semibold text-slate-700">
+          Target job description <span className="font-normal text-slate-500">(optional; enables AI bullet tailoring)</span>
+          <textarea
+            maxLength={20000}
+            rows={5}
+            value={jobDescription}
+            onChange={(event) => setJobDescription(event.target.value)}
+            placeholder="Paste the job description to score its keywords and tailor your resume bullets."
+            className="mt-1 w-full rounded-lg border border-slate-300 p-3 font-normal"
+          />
+          <span className="mt-1 block text-right text-xs font-normal text-slate-500">{jobDescription.length}/20,000</span>
+        </label>
+        <label className="block rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 p-5 text-sm font-medium text-slate-700">
+          Resume file (PDF or DOCX, up to 5 MiB)
+          <input
+            type="file"
+            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            onChange={handleFileChange}
+            className="mt-3 block w-full text-sm"
+          />
+          {file && <span className="mt-2 block text-emerald-700">Selected: {file.name}</span>}
+        </label>
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full rounded-xl bg-blue-600 px-4 py-3 font-semibold text-white hover:bg-blue-700 disabled:cursor-wait disabled:opacity-60"
+        >
+          {loading ? 'Analyzing…' : 'Analyze resume'}
+        </button>
+        {jobDescription.trim() && (
+          <p className="text-xs text-slate-500">
+            Resume text is sent to the configured LLM provider only for this requested tailoring.
+          </p>
+        )}
+      </form>
+
+      {result && (
+        <section className="space-y-6 rounded-2xl bg-white p-6 shadow-md md:p-8">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-bold text-slate-900">Analysis report</h2>
+              <p className="mt-1 text-sm text-slate-600">{result.filename} · {result.target_role}</p>
+            </div>
+            <button onClick={() => window.print()} className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-white">
+              Print report
+            </button>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {[
+              ['Role match', `${result.match_score}%`],
+              ['Resume health', `${result.resume_score}/100`],
+              ['ATS readiness', `${result.ats_analysis.score}/100`],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-xl bg-indigo-50 p-4 text-center">
+                <p className="text-xs font-bold uppercase tracking-wide text-indigo-700">{label}</p>
+                <p className="mt-1 text-3xl font-extrabold text-indigo-950">{value}</p>
               </div>
             ))}
           </div>
+
+          <div>
+            <h3 className="font-semibold text-slate-900">Keyword heatmap</h3>
+            <p className="mb-3 text-xs text-slate-500">
+              {result.ats_analysis.word_count} words · {result.ats_analysis.benchmark_note}
+            </p>
+            {result.ats_analysis.keyword_heatmap.length ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead><tr className="border-b text-xs uppercase text-slate-500"><th className="p-2">Keyword</th><th className="p-2">Mentions</th><th className="p-2">Density</th><th className="p-2">Status</th></tr></thead>
+                  <tbody>
+                    {result.ats_analysis.keyword_heatmap.map((item) => (
+                      <tr key={item.term} className="border-b border-slate-100">
+                        <td className="p-2 font-medium">{item.term}</td>
+                        <td className="p-2">{item.mentions}</td>
+                        <td className="p-2">{item.density_percent}%</td>
+                        <td className={`p-2 font-semibold ${item.status === 'missing' || item.status === 'high' ? 'text-amber-700' : 'text-emerald-700'}`}>{keywordStatus(item.status)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <p className="text-sm text-slate-600">No reference keywords were available to compare.</p>}
+          </div>
+
+          <div>
+            <h3 className="font-semibold text-slate-900">ATS structure checks</h3>
+            {result.ats_analysis.issues.length ? (
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-800">
+                {result.ats_analysis.issues.map((issue) => <li key={issue}>{issue}</li>)}
+              </ul>
+            ) : <p className="mt-1 text-sm text-emerald-700">No structural issues detected.</p>}
+          </div>
+
+          <div>
+            <h3 className="font-semibold text-slate-900">Extracted skills</h3>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {result.extracted_skills.length
+                ? result.extracted_skills.map((skill) => <span key={skill} className="rounded-full bg-blue-100 px-3 py-1 text-xs font-semibold text-blue-800">{skill}</span>)
+                : <span className="text-sm text-slate-600">No recognized skills detected.</span>}
+            </div>
+          </div>
+
+          <div className="grid gap-5 md:grid-cols-2">
+            <div>
+              <h3 className="font-semibold text-slate-900">Priority skill gaps</h3>
+              {result.skill_gaps.length
+                ? <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-800">{result.skill_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>
+                : <p className="mt-2 text-sm text-emerald-700">No keyword gaps were detected.</p>}
+            </div>
+            <div>
+              <h3 className="font-semibold text-slate-900">Action roadmap</h3>
+              <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-slate-700">
+                {result.future_action_plan.map((step) => <li key={step}>{step}</li>)}
+              </ol>
+            </div>
+          </div>
+
+          {result.tailored_bullets.length > 0 && (
+            <div className="rounded-xl border border-purple-200 bg-purple-50 p-5">
+              <h3 className="font-semibold text-purple-950">JD-tailored bullet suggestions</h3>
+              <p className="mt-1 text-xs text-purple-800">Verify every suggestion; AI must not replace your actual experience or invent results.</p>
+              <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-purple-950">
+                {result.tailored_bullets.map((bullet, index) => <li key={`${index}-${bullet}`}>{bullet}</li>)}
+              </ul>
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="space-y-4 rounded-2xl bg-white p-6 shadow-md md:p-8">
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="text-xl font-bold text-slate-900">Analysis history</h2>
+          <span className="text-sm text-slate-500">{historyLoading ? 'Refreshing…' : `${history.length} saved`}</span>
+        </div>
+        {history.length === 0 ? (
+          <p className="text-sm text-slate-600">No previous analyses found.</p>
+        ) : (
+          <ul className="space-y-3">
+            {history.map((item) => (
+              <li key={item.id} className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div>
+                  <p className="font-semibold text-slate-900">{item.filename}</p>
+                  <p className="text-xs text-slate-600">{item.target_role}{item.created_at ? ` · ${new Date(item.created_at).toLocaleString()}` : ''}</p>
+                  {item.skill_gaps.length > 0 && <p className="mt-1 text-xs text-amber-800">Gaps: {item.skill_gaps.join(', ')}</p>}
+                  <details className="mt-2 text-xs text-slate-700">
+                    <summary className="cursor-pointer font-semibold text-blue-700">Saved roadmap and diagnostics</summary>
+                    <ol className="mt-2 list-decimal space-y-1 pl-5">
+                      {item.action_roadmap.map((step) => <li key={step}>{step}</li>)}
+                    </ol>
+                    {item.ats_issues.length > 0 && (
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-amber-800">
+                        {item.ats_issues.map((issue) => <li key={issue}>{issue}</li>)}
+                      </ul>
+                    )}
+                    {item.keyword_heatmap.length > 0 && (
+                      <p className="mt-2">Keyword checks: {item.keyword_heatmap.map((keyword) => `${keyword.term} (${keyword.status})`).join(', ')}</p>
+                    )}
+                    {item.tailored_bullets.length > 0 && (
+                      <ul className="mt-2 list-disc space-y-1 pl-5">
+                        {item.tailored_bullets.map((bullet, bulletIndex) => <li key={`${bulletIndex}-${bullet}`}>{bullet}</li>)}
+                      </ul>
+                    )}
+                  </details>
+                </div>
+                <div className="flex gap-4 text-right text-sm">
+                  <span><span className="block text-xs text-slate-500">Match</span><strong>{item.match_score}%</strong></span>
+                  <span><span className="block text-xs text-slate-500">Health</span><strong>{item.resume_score}/100</strong></span>
+                  <span><span className="block text-xs text-slate-500">ATS</span><strong>{item.ats_score}/100</strong></span>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
-      </div>
-    </div>
-  );
+      </section>
+    </main>
+  )
 }

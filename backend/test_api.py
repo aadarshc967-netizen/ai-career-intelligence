@@ -2,6 +2,7 @@ import os
 from io import BytesIO
 
 os.environ["JWT_SECRET_KEY"] = "test-only-signing-key-with-at-least-32-characters"
+os.environ["CORS_ORIGINS"] = "https://careeriq-rho.vercel.app,http://localhost:5173"
 
 import pytest
 from docx import Document
@@ -11,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database import Base
-from main import app, get_db
+from main import app, get_db, parse_cors_origins, validate_jwt_secret
 
 
 @pytest.fixture
@@ -44,6 +45,50 @@ def create_docx_resume() -> bytes:
     output = BytesIO()
     document.save(output)
     return output.getvalue()
+
+
+def test_cors_preflight_supports_bearer_auth_and_rejects_unknown_origins(client):
+    preflight = client.options(
+        "/analyze-career",
+        headers={
+            "Origin": "https://careeriq-rho.vercel.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "https://careeriq-rho.vercel.app"
+    assert "POST" in preflight.headers["access-control-allow-methods"]
+    assert "PUT" in preflight.headers["access-control-allow-methods"]
+    assert "DELETE" in preflight.headers["access-control-allow-methods"]
+    assert "authorization" in preflight.headers["access-control-allow-headers"].lower()
+    assert preflight.headers.get("access-control-allow-credentials") != "true"
+
+    rejected = client.options(
+        "/analyze-career",
+        headers={
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert rejected.status_code == 400
+    assert "access-control-allow-origin" not in rejected.headers
+
+
+def test_environment_configuration_rejects_weak_secrets_and_wildcard_cors():
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        validate_jwt_secret(None)
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        validate_jwt_secret("too-short")
+    assert len(validate_jwt_secret("a-random-secret-with-at-least-32-characters")) >= 32
+
+    assert parse_cors_origins("https://careeriq-rho.vercel.app/") == [
+        "https://careeriq-rho.vercel.app",
+    ]
+    with pytest.raises(RuntimeError, match="wildcard"):
+        parse_cors_origins("*")
+    with pytest.raises(RuntimeError, match="invalid origin"):
+        parse_cors_origins("https://careeriq-rho.vercel.app/path")
 
 
 def test_authenticated_analysis_and_history_are_private(client):

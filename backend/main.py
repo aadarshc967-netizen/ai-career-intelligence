@@ -7,6 +7,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -34,9 +35,34 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-if not SECRET_KEY or len(SECRET_KEY) < 32:
-    raise RuntimeError("Set JWT_SECRET_KEY to a secret of at least 32 characters")
+
+
+def validate_jwt_secret(secret: str | None) -> str:
+    if not secret or len(secret) < 32:
+        raise RuntimeError("Set JWT_SECRET_KEY to a secret of at least 32 characters")
+    return secret
+
+
+def parse_cors_origins(value: str) -> list[str]:
+    origins = [origin.strip().rstrip("/") for origin in value.split(",") if origin.strip()]
+    if not origins or "*" in origins:
+        raise RuntimeError("CORS_ORIGINS must contain explicit frontend origins; wildcard origins are not allowed")
+    for origin in origins:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"https", "http"}
+            or not parsed.netloc
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise RuntimeError(f"CORS_ORIGINS contains an invalid origin: {origin}")
+    return origins
+
+
+SECRET_KEY = validate_jwt_secret(os.getenv("JWT_SECRET_KEY"))
 
 app = FastAPI(
     title="AI Career Intelligence API",
@@ -44,13 +70,17 @@ app = FastAPI(
     version="2.0.0",
 )
 
-configured_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+configured_origins = os.getenv(
+    "CORS_ORIGINS",
+    "https://careeriq-rho.vercel.app,http://localhost:5173,http://127.0.0.1:5173",
+)
+allowed_origins = parse_cors_origins(configured_origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in configured_origins.split(",") if origin.strip()],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 bearer_scheme = HTTPBearer(auto_error=False)

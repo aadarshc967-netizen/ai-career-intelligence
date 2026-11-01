@@ -7,6 +7,8 @@ venv/
 # Environment
 .env
 .env.*
+!.env.example
+!frontend/.env.example
 
 # Node
 node_modules/
@@ -22,6 +24,9 @@ Thumbs.db
 
 # Uploaded files
 uploads/
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs
 *.log
