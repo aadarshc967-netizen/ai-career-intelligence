@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { apiRequest } from '../lib/api'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import { ApiError, apiRequest } from '../lib/api'
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024
 
@@ -83,6 +83,42 @@ export default function ResumeUpload() {
   const authInFlight = useRef(false)
   const analysisInFlight = useRef(false)
 
+  const logout = useCallback((message?: string) => {
+    localStorage.removeItem('accessToken')
+    localStorage.removeItem('userName')
+    localStorage.removeItem('userEmail')
+    setToken('')
+    setUserName('')
+    setUserEmail('')
+    setHistory([])
+    setResult(null)
+    setError(message ?? null)
+  }, [])
+
+  const handleProtectedRequestError = useCallback((requestError: unknown, requestToken: string) => {
+    if (!(requestError instanceof ApiError) || requestError.status !== 401) return false
+    if (localStorage.getItem('accessToken') === requestToken) {
+      logout('Your session has expired or is no longer valid. Please sign in again.')
+    }
+    return true
+  }, [logout])
+
+  useEffect(() => {
+    const synchronizeSession = (event: StorageEvent) => {
+      if (event.key !== null && !['accessToken', 'userName', 'userEmail'].includes(event.key)) return
+      const latestToken = localStorage.getItem('accessToken') ?? ''
+      if (!latestToken) {
+        logout()
+        return
+      }
+      setToken(latestToken)
+      setUserName(localStorage.getItem('userName') ?? '')
+      setUserEmail(localStorage.getItem('userEmail') ?? '')
+    }
+    window.addEventListener('storage', synchronizeSession)
+    return () => window.removeEventListener('storage', synchronizeSession)
+  }, [logout])
+
   useEffect(() => {
     if (!token || !userEmail) return
     let active = true
@@ -96,7 +132,7 @@ export default function ResumeUpload() {
         if (!Array.isArray(data)) throw new Error('The history response was invalid.')
         if (active) setHistory(data)
       } catch (requestError) {
-        if (active) {
+        if (active && !handleProtectedRequestError(requestError, token)) {
           setError(requestError instanceof Error ? requestError.message : 'Unable to load analysis history.')
         }
       } finally {
@@ -107,7 +143,7 @@ export default function ResumeUpload() {
     return () => {
       active = false
     }
-  }, [token, userEmail])
+  }, [handleProtectedRequestError, token, userEmail])
 
   const handleAuthentication = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -191,29 +227,22 @@ export default function ResumeUpload() {
         if (!Array.isArray(updatedHistory)) throw new Error('The history response was invalid.')
         setHistory(updatedHistory)
       } catch (historyError) {
-        setError(
-          `Analysis completed, but history could not be refreshed: ${
-            historyError instanceof Error ? historyError.message : 'Please reload history.'
-          }`,
-        )
+        if (!handleProtectedRequestError(historyError, token)) {
+          setError(
+            `Analysis completed, but history could not be refreshed: ${
+              historyError instanceof Error ? historyError.message : 'Please reload history.'
+            }`,
+          )
+        }
       }
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Unable to analyze this resume.')
+      if (!handleProtectedRequestError(requestError, token)) {
+        setError(requestError instanceof Error ? requestError.message : 'Unable to analyze this resume.')
+      }
     } finally {
       analysisInFlight.current = false
       setLoading(false)
     }
-  }
-
-  const logout = () => {
-    localStorage.removeItem('accessToken')
-    localStorage.removeItem('userName')
-    localStorage.removeItem('userEmail')
-    setToken('')
-    setUserName('')
-    setUserEmail('')
-    setHistory([])
-    setResult(null)
   }
 
   if (!token) {
@@ -298,7 +327,7 @@ export default function ResumeUpload() {
           <h1 className="mt-1 text-2xl font-bold">Welcome, {userName}</h1>
           <p className="mt-1 text-sm text-blue-100">{userEmail}</p>
         </div>
-        <button onClick={logout} className="rounded-lg border border-white/50 px-4 py-2 text-sm hover:bg-white/10">
+        <button onClick={() => logout()} className="rounded-lg border border-white/50 px-4 py-2 text-sm hover:bg-white/10">
           Sign out
         </button>
       </section>
